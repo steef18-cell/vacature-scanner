@@ -1,6 +1,8 @@
 import io
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+import urllib.request
 import streamlit as st
 import pandas as pd
 from jobspy import scrape_jobs
@@ -12,12 +14,43 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# Standaardinstellingen ('Supermarkt' verwijderd, Sales/Verkoop toegevoegd aan uitsluitingen)
-DEFAULT_TITELS = "Brand Manager, Brand Management, Product Marketing Manager, Trade Marketeer, Brand Activation Manager, Category Manager"
-DEFAULT_SECTOREN = "Horeca, Hospitality, Travel, Tourism, Hotel, Restaurant, Retail, FMCG, E-commerce, Fashion, Publisher, Uitgeverij, Media"
-DEFAULT_UITSLUITINGEN = "Stage, Intern, Internship, Stagiair, Trainee, Junior, Store Manager, Shop Manager, Brand Ambassador, Ambassadeur, Winkelmedewerker, Verkoopspecialist, Verkoper, Sales, Accountmanager, Account Manager, Recruiter, Klantenservice, Customer Service, Monteur, Chauffeur, Beveiliger, Oncology, Pharma"
-DEFAULT_KERNWOORDEN_TITEL = "Brand, Marketing, Marketeer, Category, Trade, Product, Activation"
-DEFAULT_EXTRA_SITES = "nationalevacaturebank.nl, hotelprofessionals.nl, werkenbij.nl"
+# 1. Functietitels waarmee gezocht wordt
+DEFAULT_TITELS = (
+    "Brand Manager, Brand Management, Product Marketing Manager, "
+    "Trade Marketeer, Brand Activation Manager, Category Manager, Marketing Manager"
+)
+
+# 2. Verplichte kernwoorden in de gevonden titel (houdt Sales/Verkoop/etc. buiten de deur)
+DEFAULT_KERNWOORDEN_TITEL = (
+    "Brand, Merk, Marketing, Marketeer, Category, Categorie, Trade, Product, Activation, Campagne, Campaign"
+)
+
+# 3. Uitgebreide sectortrefwoorden + grote werkgevers in deze 5 sectoren (regio Amsterdam)
+DEFAULT_SECTOREN = (
+    "Horeca, Hospitality, Hotel, Hotels, Restaurant, Restaurants, Cafe, Catering, Bar, Foodservice, "
+    "Travel, Tourism, Toerisme, Reizen, Reis, Airline, Luchtvaart, Aviation, Vakantie, Leisure, Mobility, "
+    "Retail, Winkel, Winkels, E-commerce, Ecommerce, Webshop, Omnichannel, Marketplace, "
+    "FMCG, Consumer Goods, Consumentengoederen, Food, Voeding, Beverage, Drinks, Dranken, Bier, Koffie, "
+    "Fashion, Mode, Apparel, Kleding, Schoenen, Footwear, Sportswear, Denim, Luxury, Cosmetics, Cosmetica, Beauty, Lifestyle, "
+    "Warenhuis, Department Store, DIY, Tuincentrum, Elektronica, "
+    "Publisher, Publishing, Uitgever, Uitgeverij, Media, Tijdschrift, Magazine, Krant, Boeken, Nieuws, Broadcasting, Entertainment, "
+    "Heineken, Booking, KLM, Transavia, SkyTeam, Corendon, TUI, Accor, Marriott, Hilton, CitizenM, Soho House, "
+    "Rituals, Bijenkorf, HEMA, Etos, Gall, Ahold, Nike, Adidas, PVH, Tommy Hilfiger, Calvin Klein, Karl Lagerfeld, "
+    "Suitsupply, G-Star, Scotch, Bestseller, Inditex, Zara, H&M, Action, IKEA, Dyson, Philips, L'Oreal, Unilever, "
+    "Nestle, Danone, Kraft Heinz, Mondelez, PepsiCo, Coca-Cola, Red Bull, Jacobs Douwe Egberts, JDE, Tony's, "
+    "DPG, Mediahuis, Hearst, FD Mediagroep, RTL, Talpa, Fremantle, Elsevier, Wolters Kluwer, Veen Media, ANWB"
+)
+
+# 4. Uitsluitingen in de functietitel
+DEFAULT_UITSLUITINGEN = (
+    "Stage, Intern, Internship, Stagiair, Trainee, Junior, Store Manager, Shop Manager, Assistant Store, "
+    "Brand Ambassador, Ambassadeur, Winkelmedewerker, Verkoopspecialist, Verkoper, Sales, Accountmanager, "
+    "Account Manager, Business Development, Recruiter, Recruitment, HR, Klantenservice, Customer Service, "
+    "Monteur, Chauffeur, Beveiliger, Oncology, Pharma, Medical, Clinical, Finance, Controller, Accountant, "
+    "Software, Developer, Engineer, Data Scientist, IT"
+)
+
+DEFAULT_EXTRA_SITES = "nationalevacaturebank.nl, hotelprofessionals.nl, werkenbij.nl, fashionunited.nl, marketingtribune.nl"
 
 
 def parse_list(csv_string):
@@ -41,6 +74,74 @@ def detect_language(text):
     return "Onbekend"
 
 
+def fetch_single_linkedin_desc(url):
+    """Haalt snel de tekst op van één relevante LinkedIn-vacature als de samenvatting leeg is."""
+    if not url or "linkedin.com" not in url:
+        return ""
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        )
+        with urllib.request.urlopen(req, timeout=4) as resp:
+            html = resp.read().decode("utf-8", errors="ignore")
+        # Zoek de beschrijvingstekst in de HTML
+        match = re.search(r'<div class="[^"]*show-more-less-html__markup[^"]*"[^>]*>(.*?)</div>', html, re.DOTALL)
+        if match:
+            clean = re.sub(r"<[^>]+>", " ", match.group(1))
+            return re.sub(r"\s+", " ", clean).strip()
+    except Exception:
+        pass
+    return ""
+
+
+def enrich_missing_descriptions(df_candidates):
+    """Vult ontbrekende beschrijvingen aan voor maximaal 35 kandidaten tegelijk (duurt ~3 seconden)."""
+    if df_candidates.empty:
+        return df_candidates
+
+    urls_to_fetch = {}
+    for idx, row in df_candidates.iterrows():
+        desc = str(row.get("description", "") or "").strip()
+        url = str(row.get("job_url", "") or "").strip()
+        if not desc and "linkedin.com" in url:
+            urls_to_fetch[idx] = url
+
+    if not urls_to_fetch:
+        return df_candidates
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        future_to_idx = {executor.submit(fetch_single_linkedin_desc, url): idx for idx, url in list(urls_to_fetch.items())[:35]}
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                text = future.result()
+                if text:
+                    df_candidates.at[idx, "description"] = text
+            except Exception:
+                pass
+
+    return df_candidates
+
+
+def scrape_single_title(titel, vaste_bronnen, locatie, distance_miles, hours_old):
+    """Voert een zoekopdracht uit voor één functietitel."""
+    try:
+        jobs = scrape_jobs(
+            site_name=vaste_bronnen,
+            search_term=titel,  # Geen aanhalingstekens meer zodat variaties ook gevonden worden
+            location=locatie,
+            distance=distance_miles,
+            hours_old=hours_old,
+            results_wanted=40,
+            country_indeed="Netherlands",
+            linkedin_fetch_description=False
+        )
+        return jobs if jobs is not None else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
 def scrape_extra_sites(extra_sites, functietitels, locatie, dagen_terug):
     if not extra_sites or not functietitels:
         return pd.DataFrame()
@@ -54,8 +155,6 @@ def scrape_extra_sites(extra_sites, functietitels, locatie, dagen_terug):
 
     stad = locatie.split(",")[0].strip()
     results = []
-
-    # Combineer functietitels in één zoekopdracht per site voor snelheid
     titels_query = " OR ".join([f'"{t}"' for t in functietitels[:4]])
 
     with DDGS() as ddgs:
@@ -93,17 +192,13 @@ def filter_jobs(df_raw, functietitels, kernwoorden_titel, sectoren, uitsluitinge
 
     seen_urls = set()
     seen_keys = set()
-    accepted = []
+    pre_filtered_rows = []
 
+    # STAP 1: Filter eerst op Functietitel en Uitsluitingen (en ontdubbel)
     for _, row in df_raw.iterrows():
         url = str(row.get("job_url", "")).strip()
         title = str(row.get("title", "")).strip()
         company = str(row.get("company", "")).strip()
-        location = str(row.get("location", "")).strip()
-        description = str(row.get("description", "") or "").strip()
-        site = str(row.get("site", "")).strip()
-        date_posted = str(row.get("date_posted", "")).strip()
-        job_type = str(row.get("job_type", "") or "").strip()
 
         if not title:
             continue
@@ -114,25 +209,48 @@ def filter_jobs(df_raw, functietitels, kernwoorden_titel, sectoren, uitsluitinge
 
         title_lower = title.lower()
 
-        # 1. Uitsluitingen in de titel
+        # Uitsluitingen controleren
         if any(excl in title_lower for excl in uitsluitingen_lower):
             continue
 
-        # 2. Strenge controle op Functietitel (voorkomt irrelevante Sales/Verkoop rollen)
+        # Verplichte kernwoorden in titel controleren
         if kernwoorden_lower:
             heeft_kernwoord = any(k in title_lower for k in kernwoorden_lower)
             heeft_exacte_titel = any(t in title_lower for t in functietitels_lower)
             if not (heeft_kernwoord or heeft_exacte_titel):
                 continue
 
-        # 3. Taalfilter
+        if url:
+            seen_urls.add(url)
+        seen_keys.add(dedup_key)
+        pre_filtered_rows.append(row)
+
+    if not pre_filtered_rows:
+        return pd.DataFrame()
+
+    df_candidates = pd.DataFrame(pre_filtered_rows).reset_index(drop=True)
+
+    # STAP 2: Haal voor de overgebleven LinkedIn-kandidaten razendsnel de vacaturetekst op
+    df_candidates = enrich_missing_descriptions(df_candidates)
+
+    # STAP 3: Filter op Taal en Sector
+    accepted = []
+    for _, row in df_candidates.iterrows():
+        url = str(row.get("job_url", "")).strip()
+        title = str(row.get("title", "")).strip()
+        company = str(row.get("company", "")).strip()
+        location = str(row.get("location", "")).strip()
+        description = str(row.get("description", "") or "").strip()
+        site = str(row.get("site", "")).strip()
+        date_posted = str(row.get("date_posted", "")).strip()
+        job_type = str(row.get("job_type", "") or "").strip()
+
         lang = detect_language(f"{title} {description}")
         if taal_voorkeur == "Alleen Nederlands" and lang == "EN":
             continue
         if taal_voorkeur == "Alleen Engels" and lang == "NL":
             continue
 
-        # 4. Sector-matching op hele woorden (woordgrenzen)
         combined_text = f"{title} {company} {description}"
         matched_sectors = []
         for s in sectoren:
@@ -140,7 +258,7 @@ def filter_jobs(df_raw, functietitels, kernwoorden_titel, sectoren, uitsluitinge
             if re.search(pattern, combined_text, flags=re.IGNORECASE):
                 matched_sectors.append(s)
 
-        sector_label = ", ".join(matched_sectors) if matched_sectors else "Geen directe match"
+        sector_label = ", ".join(dict.fromkeys(matched_sectors)) if matched_sectors else "Geen directe match"
 
         if strengheid.startswith("Streng") and not matched_sectors:
             continue
@@ -161,10 +279,6 @@ def filter_jobs(df_raw, functietitels, kernwoorden_titel, sectoren, uitsluitinge
             "Samenvatting": short_desc
         })
 
-        if url:
-            seen_urls.add(url)
-        seen_keys.add(dedup_key)
-
     return pd.DataFrame(accepted)
 
 
@@ -180,7 +294,7 @@ with col_top1:
         value=7
     )
 with col_top2:
-    straal_km = st.number_input("Straal rondom locatie (km)", min_value=5, max_value=100, value=15)
+    straal_km = st.number_input("Straal rondom locatie (km)", min_value=5, max_value=100, value=20)
 
 with st.expander("Zoekfilters, Zoektermen & Websites aanpassen"):
     col1, col2 = st.columns(2)
@@ -194,15 +308,11 @@ with st.expander("Zoekfilters, Zoektermen & Websites aanpassen"):
         extra_sites_input = st.text_area(
             "Andere websites / bedrijfssites (komma-gescheiden)",
             value=DEFAULT_EXTRA_SITES,
-            height=70
+            height=75
         )
         taal_voorkeur = st.selectbox(
             "Taal van de vacature",
             options=["Beide (NL & EN)", "Alleen Nederlands", "Alleen Engels"]
-        )
-        linkedin_diep = st.checkbox(
-            "Volledige LinkedIn-vacatureteksten ophalen (Let op: maakt scan 3 tot 4 minuten trager)",
-            value=False
         )
 
     with col2:
@@ -213,13 +323,12 @@ with st.expander("Zoekfilters, Zoektermen & Websites aanpassen"):
         )
         kernwoorden_titel_input = st.text_input(
             "Verplichte kernwoorden in functietitel (minimaal 1 vereist)",
-            value=DEFAULT_KERNWOORDEN_TITEL,
-            help="Voorkomt dat irrelevante vacatures (zoals Verkoopspecialist of Sales) doorkomen."
+            value=DEFAULT_KERNWOORDEN_TITEL
         )
         sectoren_input = st.text_area(
-            "Sectortrefwoorden (komma-gescheiden)",
+            "Sectortrefwoorden & Bedrijfsnamen (komma-gescheiden)",
             value=DEFAULT_SECTOREN,
-            height=75
+            height=110
         )
         sector_strengheid = st.selectbox(
             "Sector-filter modus",
@@ -247,51 +356,32 @@ if st.button("Start Live Vacaturescan", type="primary", use_container_width=True
     distance_miles = max(5, round(straal_km * 0.621371))
 
     all_dfs = []
-    progress_text = st.empty()
-    progress_bar = st.progress(0)
 
-    total_steps = (len(functietitels) if vaste_bronnen else 0) + (1 if extra_sites else 0)
-    current_step = 0
+    with st.spinner(f"Vacatures van de afgelopen {dagen_terug} dagen worden parallel opgehaald en verrijkt..."):
+        # Parallel ophalen van alle functietitels tegelijk (veel sneller)
+        if vaste_bronnen and functietitels:
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                futures = [
+                    executor.submit(scrape_single_title, titel, vaste_bronnen, locatie, distance_miles, hours_old)
+                    for titel in functietitels
+                ]
+                for future in as_completed(futures):
+                    res_df = future.result()
+                    if not res_df.empty:
+                        all_dfs.append(res_df)
 
-    if vaste_bronnen and functietitels:
-        for titel in functietitels:
-            current_step += 1
-            progress_text.text(f"Bezig met zoeken naar '{titel}' ({current_step}/{total_steps})...")
-            progress_bar.progress(current_step / max(1, total_steps))
-            try:
-                jobs = scrape_jobs(
-                    site_name=vaste_bronnen,
-                    search_term=f'"{titel}"',
-                    location=locatie,
-                    distance=distance_miles,
-                    hours_old=hours_old,
-                    results_wanted=20,
-                    country_indeed="Netherlands",
-                    linkedin_fetch_description=linkedin_diep
-                )
-                if jobs is not None and not jobs.empty:
-                    all_dfs.append(jobs)
-            except Exception as e:
-                st.warning(f"Fout bij '{titel}' op vaste bronnen: {e}")
+        if extra_sites and functietitels:
+            df_extra = scrape_extra_sites(extra_sites, functietitels, locatie, dagen_terug)
+            if not df_extra.empty:
+                all_dfs.append(df_extra)
 
-    if extra_sites and functietitels:
-        current_step += 1
-        progress_text.text("Bezig met doorzoeken van extra websites...")
-        progress_bar.progress(1.0)
-        df_extra = scrape_extra_sites(extra_sites, functietitels, locatie, dagen_terug)
-        if not df_extra.empty:
-            all_dfs.append(df_extra)
-
-    progress_text.empty()
-    progress_bar.empty()
-
-    if all_dfs:
-        df_combined = pd.concat(all_dfs, ignore_index=True)
-        st.session_state["resultaten_df"] = filter_jobs(
-            df_combined, functietitels, kernwoorden_titel, sectoren, uitsluitingen, taal_voorkeur, sector_strengheid
-        )
-    else:
-        st.session_state["resultaten_df"] = pd.DataFrame()
+        if all_dfs:
+            df_combined = pd.concat(all_dfs, ignore_index=True)
+            st.session_state["resultaten_df"] = filter_jobs(
+                df_combined, functietitels, kernwoorden_titel, sectoren, uitsluitingen, taal_voorkeur, sector_strengheid
+            )
+        else:
+            st.session_state["resultaten_df"] = pd.DataFrame()
 
 # --- RESULTATEN WEERGEVEN & EXPORTEREN ---
 df_res = st.session_state["resultaten_df"]
@@ -318,54 +408,4 @@ if not df_res.empty:
             df_res["Samenvatting"].str.lower().str.contains(q, na=False)
         )
 
-    df_view = df_res[mask].copy()
-    st.markdown(f"**Gevonden vacatures:** {len(df_view)} (van {len(df_res)} totaal)")
-
-    datum_str = datetime.now().strftime("%Y-%m-%d")
-    col_dl1, col_dl2 = st.columns(2)
-
-    with col_dl1:
-        excel_buffer = io.BytesIO()
-        with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
-            df_view.to_excel(writer, index=False, sheet_name="Vacatures")
-        st.download_button(
-            label="Download Excel (.xlsx)",
-            data=excel_buffer.getvalue(),
-            file_name=f"vacatures_{datum_str}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True
-        )
-
-    with col_dl2:
-        csv_data = df_view.to_csv(index=False).encode("utf-8-sig")
-        st.download_button(
-            label="Download CSV (.csv)",
-            data=csv_data,
-            file_name=f"vacatures_{datum_str}.csv",
-            mime="text/csv",
-            use_container_width=True
-        )
-
-    weergave = st.radio("Weergave:", ["Mobiele kaarten", "Tabel"], horizontal=True)
-
-    if weergave == "Mobiele kaarten":
-        for _, row in df_view.iterrows():
-            with st.container(border=True):
-                st.markdown(f"**{row['Functietitel']}** — *{row['Bedrijf']}*")
-                st.caption(f"📍 {row['Locatie']} | 🏷️ {row['Sector Match']} | 🌐 {row['Bron']} | 📅 {row['Geplaatst']}")
-                if row["Samenvatting"]:
-                    st.write(row["Samenvatting"])
-                if row["Url"]:
-                    st.link_button("Open vacature", row["Url"], use_container_width=True)
-    else:
-        st.dataframe(
-            df_view,
-            column_config={
-                "Url": st.column_config.LinkColumn("Link", display_text="Open vacature"),
-                "Samenvatting": st.column_config.TextColumn("Samenvatting", width="large")
-            },
-            hide_index=True,
-            use_container_width=True
-        )
-else:
-    st.info("Pas indien gewenst de filters aan en tik op 'Start Live Vacaturescan'.")
+    df_view = df_
